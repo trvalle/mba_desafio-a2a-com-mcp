@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# AI_SERVER_VALIDATED_MBA_A2A_MCP_20260929: preserved implementation, syntax-checked before promotion.
 """Servidor MCP Streamable HTTP da Central de Salas.
 
 O endpoint e intencionalmente pequeno: o desafio avalia o wire contract MCP,
@@ -378,3 +379,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
