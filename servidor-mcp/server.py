@@ -31,7 +31,7 @@ SERVER_INFO = {"name": "central-de-salas", "version": "1.0.0"}
 STATE_TTL_SECONDS = 15 * 60
 INPUT_KEY = "__main__:escolha_de_sala"
 REQUIRED_CAPABILITY = {"elicitation": {"form": {}}}
-RESERVATIONS_LOCK = threading.Lock()
+RESERVATIONS_LOCK = threading.RLock()
 
 
 def _read_json(path: Path) -> Any:
@@ -101,7 +101,7 @@ def open_request_state(token: Any) -> dict[str, Any]:
         payload = json.loads(_unb64(body).decode("utf-8"))
     except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError, base64.binascii.Error) as exc:
         raise ValueError("requestState invalido") from exc
-    if payload.get("v") != 1 or payload.get("tool") != "reservar_sala":
+    if not isinstance(payload, dict) or payload.get("v") != 1 or payload.get("tool") != "reservar_sala":
         raise ValueError("requestState invalido")
     if not isinstance(payload.get("exp"), int) or payload["exp"] < int(time.time()):
         raise ValueError("requestState expirado")
@@ -244,6 +244,12 @@ def _rpc_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
 
 
 def handle_rpc(body: dict[str, Any], headers: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    # A consulta de conflitos e a gravacao formam uma operacao atomica.
+    with RESERVATIONS_LOCK:
+        return _handle_rpc(body, headers)
+
+
+def _handle_rpc(body: dict[str, Any], headers: dict[str, str]) -> tuple[int, dict[str, Any]]:
     request_id = body.get("id")
     method = body.get("method")
     params = body.get("params") or {}
@@ -283,8 +289,30 @@ def handle_rpc(body: dict[str, Any], headers: dict[str, str]) -> tuple[int, dict
             return 200, {"jsonrpc": "2.0", "id": request_id, "error": _rpc_error(-32602, "Unknown tool")}
         if not isinstance(arguments, dict):
             return 400, {"jsonrpc": "2.0", "id": request_id, "error": _rpc_error(-32602, "Invalid arguments")}
+        if ("inputResponses" in params or "requestState" in params) and name != "reservar_sala":
+            return 400, {"jsonrpc": "2.0", "id": request_id, "error": _rpc_error(-32602, "requestState invalido para esta tool")}
         if name == "listar_salas":
             result = _complete({"salas": ROOMS})
+        elif name == "reservar_sala" and "inputResponses" in params:
+            try:
+                sealed = open_request_state(params.get("requestState"))
+                if params.get("name") != sealed["tool"] or not isinstance(params.get("inputResponses"), dict) or INPUT_KEY not in params["inputResponses"]:
+                    raise ValueError("requestState invalido")
+                response = params["inputResponses"][INPUT_KEY]
+                action = response.get("action") if isinstance(response, dict) else None
+                if action in {"decline", "cancel"}:
+                    result = _complete({"reserva": None, "reservado": False, "sala": None, "inicio": None, "fim": None, "responsavel": None, "politica": None, "motivo": "recusado" if action == "decline" else "cancelado"})
+                elif action == "accept" and isinstance(response.get("content"), dict) and response["content"].get("sala") in sealed["alternatives"]:
+                    original = dict(sealed["arguments"])
+                    original["sala"] = response["content"]["sala"]
+                    if _conflicts(original["sala"], original["inicio"], original["fim"]):
+                        result = _tool_error("Sala alternativa indisponivel no intervalo")
+                    else:
+                        result = _complete(_reserve(original))
+                else:
+                    raise ValueError("inputResponse invalida")
+            except ValueError as exc:
+                result = {"__error__": _rpc_error(-32602, str(exc))}
         else:
             required = ["sala", "inicio", "fim"]
             if name == "reservar_sala":
@@ -313,23 +341,7 @@ def handle_rpc(body: dict[str, Any], headers: dict[str, str]) -> tuple[int, dict
                         else:
                             state = seal_request_state({key: arguments[key] for key in required}, alternatives)
                             result = {"inputRequests": {INPUT_KEY: {"method": "elicitation/create", "params": {"message": "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa.", "mode": "form", "requestedSchema": {"type": "object", "properties": {"sala": {"type": "string", "title": "Sala", "description": "Sala alternativa escolhida", "enum": alternatives}}, "required": ["sala"]}}}}, "requestState": state, "resultType": "input_required", "_meta": {"io.modelcontextprotocol/serverInfo": SERVER_INFO}}
-                    if name == "reservar_sala" and "inputResponses" in params:
-                        try:
-                            sealed = open_request_state(params.get("requestState"))
-                            if params.get("name") != sealed["tool"] or not isinstance(params.get("inputResponses"), dict) or INPUT_KEY not in params["inputResponses"]:
-                                raise ValueError("requestState invalido")
-                            response = params["inputResponses"][INPUT_KEY]
-                            action = response.get("action") if isinstance(response, dict) else None
-                            if action in {"decline", "cancel"}:
-                                result = _complete({"reserva": None, "reservado": False, "sala": None, "inicio": None, "fim": None, "responsavel": None, "politica": None, "motivo": "recusado" if action == "decline" else "cancelado"})
-                            elif action == "accept" and isinstance(response.get("content"), dict) and response["content"].get("sala") in sealed["alternatives"]:
-                                original = dict(sealed["arguments"])
-                                original["sala"] = response["content"]["sala"]
-                                result = _complete(_reserve(original))
-                            else:
-                                raise ValueError("inputResponse invalida")
-                        except ValueError as exc:
-                            result = {"__error__": _rpc_error(-32602, str(exc))}
+
     else:
         return 400, {"jsonrpc": "2.0", "id": request_id, "error": _rpc_error(-32601, "Method not found")}
 
@@ -360,9 +372,10 @@ class Handler(BaseHTTPRequestHandler):
             status, response = 400, {"jsonrpc": "2.0", "id": None, "error": _rpc_error(-32700, "Parse error")}
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(json.dumps(response).encode("utf-8"))))
+        encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(encoded)
 
 
 def main() -> None:
